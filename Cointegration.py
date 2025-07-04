@@ -1,5 +1,4 @@
 import pandas as pd
-import yfinance as yf
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
@@ -7,219 +6,237 @@ import pytz
 import itertools
 import time
 import requests
-from bs4 import BeautifulSoup
-from io import StringIO
 from statsmodels.tsa.stattools import adfuller
 import re
+import os # Import the os module to handle file paths
 
 # --- Configuration ---
 SHORT_TERM_HOURS = 250
-LONG_TERM_HOURS = 10000 
+LONG_TERM_HOURS = 10000
 SIGNIFICANCE_LEVEL = 0.05
 MIN_DATA_POINTS = 100
-MAX_RETRIES = 3
 
-def get_crypto_tickers():
+# Bitunix API Configuration
+BITUNIX_FUTURES_API_URL = "https://fapi.bitunix.com"
+
+
+def get_bitunix_futures_symbols():
     """
-    Scrapes top cryptocurrency tickers from Yahoo Finance with a fallback list.
+    Fetches all USDT-margined perpetual futures symbols from the Bitunix exchange.
     """
+    print("Fetching available futures symbols from Bitunix...")
     try:
-        url = "https://finance.yahoo.com/cryptocurrencies?count=50"
-        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        table = soup.find('table')
-        df = pd.read_html(StringIO(str(table)))[0]
-        tickers = df['Symbol'].dropna().astype(str).tolist()
-        return tickers
+        endpoint = "/api/v1/futures/market/tickers"
+        resp = requests.get(BITUNIX_FUTURES_API_URL + endpoint)
+        resp.raise_for_status()
+        data = resp.json().get('data', [])
+        symbols = [item['symbol'] for item in data if item['symbol'].endswith('USDT')]
+        print(f"Found {len(symbols)} USDT-margined futures symbols.")
+        return symbols
     except Exception as e:
-        print(f"Warning: Ticker scraping failed ({e}). Using a fallback list.")
-        return [
-            'BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD',
-            'ADA-USD', 'DOGE-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD',
-            'TRX-USD', 'MATIC-USD', 'LTC-USD',
-            'BCH-USD', 'UNI-USD', 'ATOM-USD', 'XLM-USD', 'ETC-USD'
-        ]
+        print(f"Error fetching symbols from Bitunix: {e}")
+        return []
+
+
+def fetch_bitunix_kline(symbol, hours):
+    """
+    Fetches historical K-line (candlestick) data for a given symbol from Bitunix.
+    """
+    endpoint = "/api/v1/futures/market/kline"
+    end_ms = int(datetime.datetime.now(pytz.utc).timestamp() * 1000)
+    start_ms = end_ms - hours * 3600 * 1000
+
+    params = {
+        "symbol": symbol,
+        "interval": "1h",  # 1 hour intervals
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": 1500
+    }
+
+    try:
+        resp = requests.get(BITUNIX_FUTURES_API_URL + endpoint, params=params)
+        resp.raise_for_status()
+        raw = resp.json().get('data', [])
+        if not raw:
+            return None
+
+        df = pd.DataFrame(raw, columns=[
+            'time', 'open', 'high', 'low', 'close', 'volume',
+            'quoteVolume', 'numTrades', 'takerBuyVolume', 'takerBuyQuoteVolume'
+        ])
+        df['time'] = pd.to_datetime(pd.to_numeric(df['time']), unit='ms', utc=True)
+        df.set_index('time', inplace=True)
+        df['close'] = df['close'].astype(float)
+        return df['close']
+
+    except Exception as e:
+        # Suppress repetitive errors for cleaner output
+        # print(f"Error fetching kline for {symbol}: {e}")
+        return None
+
 
 def test_cointegration(series1, series2):
     """
     Performs the Engle-Granger cointegration test on a pair of price series.
+    Returns (p-value, hedge_ratio).
     """
     X = np.vstack([np.ones(len(series1)), series2.values]).T
     y = series1.values
-    
     try:
         beta = np.linalg.lstsq(X, y, rcond=None)[0]
         spread = y - np.dot(X, beta)
-        adf_result = adfuller(spread, regression='c', autolag='BIC')
-        return adf_result[1]
-    except (np.linalg.LinAlgError, ValueError):
-        return 1.0
+        p_value = adfuller(spread, regression='c', autolag='BIC')[1]
+        return p_value, beta[1]
+    except Exception:
+        return 1.0, None
+
 
 def find_cointegrated_pairs(tickers, hours):
     """
     Scans all pairs for cointegration over a given lookback period.
+    Returns dict of pair -> stats.
     """
     print(f"\n--- Scanning for cointegrated pairs over {hours} hours ---")
-    
-    end_time = datetime.datetime.now(pytz.utc)
-    start_time = end_time - datetime.timedelta(hours=hours)
-    
-    all_data = yf.download(
-        tickers, start=start_time, end=end_time, interval='60m', 
-        auto_adjust=True, progress=False
-    )
-    
-    if all_data.empty:
-        print("Failed to download any data.")
-        return set()
-
-    close_prices = all_data['Close'].dropna(axis=1, how='all')
-    available_tickers = close_prices.columns.tolist()
-    print(f"Successfully fetched data for {len(available_tickers)} tickers for this period.")
-
-    if len(available_tickers) < 2:
-        print("Not enough data to form pairs.")
-        return set()
-
-    pairs = list(itertools.combinations(available_tickers, 2))
-    cointegrated_pairs = set()
-
-    for i, (ticker1, ticker2) in enumerate(pairs):
-        df_pair = close_prices[[ticker1, ticker2]].dropna()
-        
+    data_dict = {}
+    num_tickers = len(tickers)
+    for i, t in enumerate(tickers, 1):
+        print(f"Fetching [{i}/{num_tickers}] {t}...", end='\r', flush=True)
+        series = fetch_bitunix_kline(t, hours)
+        if series is not None and len(series) >= MIN_DATA_POINTS:
+            data_dict[t] = series
+        time.sleep(0.1)
+    keys = list(data_dict.keys())
+    print(f"\nFetched data for {len(keys)}/{num_tickers} symbols.")
+    if len(keys) < 2:
+        print("Not enough symbols to test pairs.")
+        return {}
+    pairs = list(itertools.combinations(keys, 2))
+    stats = {}
+    for i, (a, b) in enumerate(pairs, 1):
+        df_pair = pd.concat([data_dict[a], data_dict[b]], axis=1, keys=[a, b]).dropna()
         if len(df_pair) < MIN_DATA_POINTS:
             continue
-            
-        p_value = test_cointegration(df_pair[ticker1], df_pair[ticker2])
-        
-        if p_value is not None and p_value <= SIGNIFICANCE_LEVEL:
-            cointegrated_pairs.add(tuple(sorted((ticker1, ticker2))))
-            
-        print(f"Tested {i+1}/{len(pairs)} pairs - Found: {len(cointegrated_pairs)} cointegrated", end='\r', flush=True)
+        p, hr = test_cointegration(df_pair[a], df_pair[b])
+        if p <= SIGNIFICANCE_LEVEL:
+            stats[tuple(sorted((a, b)))] = {'p_value': p, 'hedge_ratio': hr}
+        print(f"Tested {i}/{len(pairs)} pairs, found {len(stats)} cointegrated", end='\r', flush=True)
 
-    print(f"\nFound {len(cointegrated_pairs)} cointegrated pairs for the {hours}-hour period.")
-    return cointegrated_pairs
+    print(f"\nFound {len(stats)} cointegrated pairs for {hours} hours.")
+    return stats
 
-def visualize_short_term_relationship(ticker1, ticker2):
+
+def visualize_relationship(pair, hours=SHORT_TERM_HOURS):
     """
-    Fetches SHORT-TERM data and creates the visualization plots for a confirmed pair.
+    Plots normalized prices and spread for a given pair.
     """
-    print(f"\nVisualizing SHORT-TERM ({SHORT_TERM_HOURS} hours) relationship for {ticker1}/{ticker2}...")
-    end_time = datetime.datetime.now(pytz.utc)
-    # FIX: Changed to fetch short-term data for visualization
-    start_time = end_time - datetime.timedelta(hours=SHORT_TERM_HOURS)
-    pair_data_df = yf.download([ticker1, ticker2], start=start_time, end=end_time, interval='60m', auto_adjust=True, progress=False)['Close']
-    pair_data_df.dropna(inplace=True)
-
-    if pair_data_df.empty or len(pair_data_df) < MIN_DATA_POINTS:
-        print(f"Could not fetch sufficient short-term data for {ticker1}/{ticker2} to visualize.")
+    a, b = pair
+    print(f"\nVisualizing {a}/{b}...")
+    df = pd.concat(
+        [fetch_bitunix_kline(a, hours), fetch_bitunix_kline(b, hours)],
+        axis=1, keys=[a, b]
+    ).dropna()
+    if df.empty or len(df) < MIN_DATA_POINTS:
+        print("Insufficient data for visualization.")
         return
 
-    # Calculate spread on the short-term data
-    X = np.vstack([np.ones(len(pair_data_df)), pair_data_df[ticker2].values]).T
-    y = pair_data_df[ticker1].values
-    beta = np.linalg.lstsq(X, y, rcond=None)[0]
-    spread = y - np.dot(X, beta)
+    X = np.vstack([np.ones(len(df)), df[b].values]).T
+    y = df[a].values
+    
+    beta_full = np.linalg.lstsq(X, y, rcond=None)[0]
+    spread = y - np.dot(X, beta_full)
 
-    # --- Plotting ---
     plt.style.use('seaborn-v0_8-darkgrid')
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12), sharex=True, 
-                                   gridspec_kw={'height_ratios': [2, 1]})
-    
-    # FIX: Updated plot title
-    fig.suptitle(f'Short-Term Cointegration Analysis: {ticker1} vs {ticker2} ({SHORT_TERM_HOURS} Hours)', fontsize=16)
-    
-    # Plot 1: Normalized Prices
-    normalized_price1 = (pair_data_df[ticker1] / pair_data_df[ticker1].iloc[0]) * 100
-    normalized_price2 = (pair_data_df[ticker2] / pair_data_df[ticker2].iloc[0]) * 100
-    
-    ax1.plot(normalized_price1, label=ticker1, color='cyan')
-    ax1.plot(normalized_price2, label=ticker2, color='magenta', alpha=0.8)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12), sharex=True)
+    fig.suptitle(f'Short-Term Cointegration Analysis: {a} vs {b} ({hours}h)', fontsize=16)
+
+    p1 = (df[a] / df[a].iloc[0]) * 100
+    p2 = (df[b] / df[b].iloc[0]) * 100
+    ax1.plot(p1, label=a)
+    ax1.plot(p2, label=b, alpha=0.8)
     ax1.set_title('Normalized Prices (Indexed to 100)')
-    ax1.set_ylabel('Normalized Price')
+    ax1.set_ylabel('Indexed Price')
     ax1.legend()
-    
-    # Plot 2: Spread
-    spread_mean = spread.mean()
-    spread_std = spread.std()
-    
-    ax2.plot(pair_data_df.index, spread, label='Spread (Residuals)', color='green')
-    ax2.axhline(spread_mean, color='black', linestyle='--', label=f'Mean: {spread_mean:.4f}')
-    ax2.axhline(spread_mean + 2 * spread_std, color='red', linestyle=':', label='+2 Std Dev')
-    ax2.axhline(spread_mean - 2 * spread_std, color='red', linestyle=':', label='-2 Std Dev')
-    
-    # FIX: Updated plot title
-    ax2.set_title(f'Short-Term Spread (Hedge Ratio: {beta[1]:.4f})')
-    ax2.set_ylabel('Spread Value')
-    ax2.set_xlabel('Date')
+
+    m, s = spread.mean(), spread.std()
+    ax2.plot(df.index, spread, label='Spread')
+    ax2.axhline(m, linestyle='--', color='black', label=f'Mean {m:.4f}')
+    ax2.axhline(m + 2*s, color='red', linestyle=':', label='+2σ')
+    ax2.axhline(m - 2*s, color='red', linestyle=':', label='-2σ')
+    ax2.set_title(f'Spread (Hedge Ratio: {beta_full[1]:.4f})')
     ax2.legend()
-    
-    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+    plt.tight_layout()
     plt.show()
 
+def save_results_to_csv(results_df):
+    """
+    Saves the results DataFrame to a CSV file in the same directory as the script.
+    """
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"cointegrated_pairs_{timestamp}.csv"
+        full_path = os.path.join(script_dir, filename)
+        
+        results_df.to_csv(full_path, index=False)
+        print(f"\n✅ Successfully saved results to: {full_path}")
+        
+    except Exception as e:
+        print(f"\n❌ Error saving CSV file: {e}")
+        print("Printing results to console as a fallback.")
+        print(results_df.to_string())
+
+
 def main():
-    """
-    Main function to run the two-stage filtering and visualization.
-    """
-    print("--- Starting Two-Stage Cointegration Analysis ---")
-    tickers = get_crypto_tickers()
+    print("--- Starting Bitunix Futures Cointegration Analysis ---")
+    symbols = get_bitunix_futures_symbols()
+    if not symbols:
+        print("Could not retrieve symbols. Exiting.")
+        return
+
+    long_stats = find_cointegrated_pairs(symbols, LONG_TERM_HOURS)
+    short_stats = find_cointegrated_pairs(symbols, SHORT_TERM_HOURS)
     
-    long_term_pairs = find_cointegrated_pairs(tickers, LONG_TERM_HOURS)
-    short_term_pairs = find_cointegrated_pairs(tickers, SHORT_TERM_HOURS)
-    
-    overlapping_pairs = long_term_pairs.intersection(short_term_pairs)
-    
+    common = set(long_stats.keys()).intersection(short_stats.keys())
+
     print("\n" + "="*50)
-    print("--- FINAL ANALYSIS COMPLETE ---")
-    
-    if overlapping_pairs:
-        sorted_pairs = sorted(list(overlapping_pairs))
+    if common:
+        results = []
+        for i, pair in enumerate(sorted(list(common)), 1):
+            # Get stats from both long and short term results
+            long_stat = long_stats[pair]
+            short_stat = short_stats.get(pair, {}) # Use .get for safety
+            
+            results.append({
+                'Index': i,
+                'Pair': f"{pair[0]}/{pair[1]}",
+                'P-Value (Long)': long_stat.get('p_value'),
+                'Hedge Ratio (Long)': long_stat.get('hedge_ratio'),
+                'P-Value (Short)': short_stat.get('p_value')
+            })
+        df_res = pd.DataFrame(results)
         
-        print(f"✅ Found {len(sorted_pairs)} pairs cointegrated on BOTH timeframes:")
-        for i, (ticker1, ticker2) in enumerate(sorted_pairs):
-            print(f"  {i+1}: {ticker1}/{ticker2}")
-        
-        print("\nEnter the numbers of the pairs you want to visualize (e.g., '1 3 5' or '2,4').")
-        print("Press Enter to visualize all, or type 'exit' to quit.")
-        
+        save_results_to_csv(df_res)
+
+        print(f"\n✅ Found {len(results)} pairs cointegrated on BOTH timeframes:")
+        # Print a clean, formatted table to the console
+        print(df_res.to_string(index=False))
+
+        sel = input("\nEnter pair numbers to visualize (or press Enter for all): ")
         try:
-            user_input = input("> ")
+            if sel.strip():
+                idxs = [int(x)-1 for x in re.findall(r'\d+', sel)]
+            else:
+                idxs = list(range(len(results)))
         except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
             return
 
-        if user_input.lower() == 'exit':
-            print("Exiting.")
-            return
-            
-        selected_indices = []
-        if user_input.strip() == '':
-            selected_indices = range(len(sorted_pairs))
-        else:
-            raw_indices = re.split(r'[,\s]+', user_input.strip())
-            for idx_str in raw_indices:
-                if idx_str.isdigit():
-                    idx = int(idx_str) - 1
-                    if 0 <= idx < len(sorted_pairs):
-                        selected_indices.append(idx)
-                    else:
-                        print(f"Warning: Invalid number '{idx_str}' ignored (out of range).")
-                elif idx_str:
-                    print(f"Warning: Invalid input '{idx_str}' ignored.")
-
-        if not selected_indices:
-            print("No valid pairs selected. Exiting.")
-            return
-
-        print(f"\nVisualizing {len(selected_indices)} selected pair(s)...")
-        for idx in selected_indices:
-            ticker1, ticker2 = sorted_pairs[idx]
-            # FIX: Changed function call to visualize the short-term relationship
-            visualize_short_term_relationship(ticker1, ticker2)
-            
+        for i in idxs:
+            if 0 <= i < len(results):
+                pair_to_visualize = tuple(results[i]['Pair'].split('/'))
+                visualize_relationship(pair_to_visualize)
     else:
-        print("❌ No pairs were found to be cointegrated on both timeframes.")
+        print("❌ No overlapping cointegrated pairs found.")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
