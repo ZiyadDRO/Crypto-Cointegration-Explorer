@@ -11,14 +11,15 @@ import re
 import os
 import sys
 
-# --- Configuration ---
-SHORT_TERM_HOURS = 338  # 338 hours = 2 weeks
-LONG_TERM_HOURS = 8765  # 8765 hours = 1 year
-MIN_LONG_TERM_CANDLES = LONG_TERM_HOURS  # Minimum required candles for long-term analysis
+# --- Updated Configuration ---
+LONG_TERM_HOURS = 8765  # 1 year (365 days * 24 hours)
+MEDIUM_TERM_HOURS = 730  # 1 month (30.4 days * 24 hours)
+SHORT_TERM_HOURS = 168   # 1 week (7 days * 24 hours)
+MIN_LONG_TERM_CANDLES = LONG_TERM_HOURS
 SIGNIFICANCE_LEVEL = 0.05
 MIN_DATA_POINTS = 100
-MAX_REQUESTS_PER_SYMBOL = 100  # Safety limit to prevent infinite loops
-MAX_PAIRS_TO_PROCESS = 100000  # Safety limit for pair processing
+MAX_REQUESTS_PER_SYMBOL = 100
+MAX_PAIRS_TO_PROCESS = 100000
 
 # Bitunix API Configuration
 BITUNIX_FUTURES_API_URL = "https://fapi.bitunix.com"
@@ -186,56 +187,66 @@ def find_cointegrated_pairs(tickers, hours):
     return stats
 
 
-def visualize_relationship(pair, hours=SHORT_TERM_HOURS):
+def visualize_three_timeframes(pair):
     """
-    Plots normalized prices and spread for a given pair.
+    Plots normalized prices and spread for a given pair across three timeframes
     """
     a, b = pair
-    debug_print(f"Visualizing {a}/{b}...")
+    timeframes = [
+        ('Long-Term (1 Year)', LONG_TERM_HOURS),
+        ('Medium-Term (1 Month)', MEDIUM_TERM_HOURS),
+        ('Short-Term (1 Week)', SHORT_TERM_HOURS)
+    ]
     
-    # Fetch data
-    series_a = fetch_bitunix_kline(a, hours)
-    series_b = fetch_bitunix_kline(b, hours)
-    
-    if series_a is None or series_b is None:
-        debug_print("Error: Could not fetch data for visualization")
-        return
-        
-    df = pd.concat([series_a, series_b], axis=1, keys=[a, b]).dropna()
-    if df.empty or len(df) < MIN_DATA_POINTS:
-        debug_print("Insufficient data for visualization.")
-        return
-
-    # Calculate spread
-    X = np.vstack([np.ones(len(df)), df[b].values]).T
-    y = df[a].values
-    beta_full = np.linalg.lstsq(X, y, rcond=None)[0]
-    spread = y - np.dot(X, beta_full)
-
-    # Create plot
     plt.style.use('seaborn-v0_8-darkgrid')
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12), sharex=True)
-    fig.suptitle(f'Cointegration Analysis: {a} vs {b} ({hours}h)', fontsize=16)
-
-    # Normalized prices
-    p1 = (df[a] / df[a].iloc[0]) * 100
-    p2 = (df[b] / df[b].iloc[0]) * 100
-    ax1.plot(p1, label=a)
-    ax1.plot(p2, label=b, alpha=0.8)
-    ax1.set_title('Normalized Prices (Indexed to 100)')
-    ax1.set_ylabel('Indexed Price')
-    ax1.legend()
-
-    # Spread
-    m, s = spread.mean(), spread.std()
-    ax2.plot(df.index, spread, label='Spread')
-    ax2.axhline(m, linestyle='--', color='black', label=f'Mean {m:.4f}')
-    ax2.axhline(m + 2*s, linestyle=':', color='red', label='+2σ')
-    ax2.axhline(m - 2*s, linestyle=':', color='red', label='-2σ')
-    ax2.set_title(f'Spread (Hedge Ratio: {beta_full[1]:.4f})')
-    ax2.legend()
+    fig, axes = plt.subplots(3, 2, figsize=(20, 18))
+    fig.suptitle(f'Cointegration Analysis: {a} vs {b}', fontsize=20, y=0.98)
     
-    plt.tight_layout()
+    for i, (title, hours) in enumerate(timeframes):
+        debug_print(f"Visualizing {a}/{b} for {title}...")
+        
+        # Fetch data
+        series_a = fetch_bitunix_kline(a, hours)
+        series_b = fetch_bitunix_kline(b, hours)
+        
+        if series_a is None or series_b is None:
+            debug_print(f"Error: Could not fetch data for {title} visualization")
+            continue
+            
+        df = pd.concat([series_a, series_b], axis=1, keys=[a, b]).dropna()
+        if df.empty or len(df) < MIN_DATA_POINTS:
+            debug_print(f"Insufficient data for {title} visualization.")
+            continue
+
+        # Calculate spread
+        X = np.vstack([np.ones(len(df)), df[b].values]).T
+        y = df[a].values
+        beta_full = np.linalg.lstsq(X, y, rcond=None)[0]
+        spread = y - np.dot(X, beta_full)
+        m, s = spread.mean(), spread.std()
+
+        # Normalized prices
+        p1 = (df[a] / df[a].iloc[0]) * 100
+        p2 = (df[b] / df[b].iloc[0]) * 100
+        
+        # Left plot: Normalized Prices
+        ax = axes[i, 0]
+        ax.plot(p1, label=a)
+        ax.plot(p2, label=b, alpha=0.8)
+        ax.set_title(f'{title} - Normalized Prices')
+        ax.set_ylabel('Indexed Price')
+        ax.legend()
+        
+        # Right plot: Spread
+        ax = axes[i, 1]
+        ax.plot(df.index, spread, label='Spread')
+        ax.axhline(m, linestyle='--', color='black', label=f'Mean {m:.4f}')
+        ax.axhline(m + 2*s, linestyle=':', color='red', label='+2σ')
+        ax.axhline(m - 2*s, linestyle=':', color='red', label='-2σ')
+        ax.set_title(f'{title} - Spread (Hedge Ratio: {beta_full[1]:.4f})')
+        ax.legend()
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
 
@@ -260,27 +271,32 @@ def save_results_to_csv(results_df):
 
 
 def main():
-    debug_print("=== Starting Cointegration Analysis ===")
+    debug_print("=== Starting Three-Timeframe Cointegration Analysis ===")
     symbols = get_bitunix_futures_symbols()
     if not symbols:
         debug_print("No symbols, exiting.")
         return
 
-    filtered_symbols = [s for s in symbols if s.endswith('USDT')]  # Limit to first 10 symbols for testing
+    filtered_symbols = [s for s in symbols if s.endswith('USDT')]
     debug_print(f"Initial symbol count: {len(filtered_symbols)}")
     
     # Pre-filter symbols with sufficient long-term data
     symbols_with_sufficient_data = []
-    symbol_counts_long = {}
+    symbol_counts = {
+        'long': {},
+        'medium': {},
+        'short': {}
+    }
+    
     for t in filtered_symbols:
-        series = fetch_bitunix_kline(t, LONG_TERM_HOURS)
-        # FLEXIBLE THRESHOLD: Allow slightly less than exact candle count
-        if series is not None and len(series) >= MIN_LONG_TERM_CANDLES - 10:  # Changed threshold
+        # Long-term check
+        series_long = fetch_bitunix_kline(t, LONG_TERM_HOURS)
+        if series_long is not None and len(series_long) >= MIN_LONG_TERM_CANDLES - 10:
             symbols_with_sufficient_data.append(t)
-            symbol_counts_long[t] = len(series)
-            debug_print(f"{t} has sufficient long-term data: {len(series)} candles")
+            symbol_counts['long'][t] = len(series_long)
+            debug_print(f"{t} has sufficient long-term data: {len(series_long)} candles")
         else:
-            count = len(series) if series is not None else 0
+            count = len(series_long) if series_long is not None else 0
             debug_print(f"Skipping {t} - insufficient long-term data: {count} candles (required: {MIN_LONG_TERM_CANDLES})")
     
     if not symbols_with_sufficient_data:
@@ -289,47 +305,55 @@ def main():
 
     debug_print(f"Proceeding with {len(symbols_with_sufficient_data)} symbols with sufficient long-term data")
     
-    # Long-term analysis (only on filtered symbols)
-    debug_print("Starting long-term cointegration analysis...")
+    # Fetch candle counts for medium and short timeframes
+    for t in symbols_with_sufficient_data:
+        for timeframe, hours in [('medium', MEDIUM_TERM_HOURS), ('short', SHORT_TERM_HOURS)]:
+            series = fetch_bitunix_kline(t, hours)
+            symbol_counts[timeframe][t] = len(series) if series is not None else 0
+
+    # Three-tiered cointegration analysis
+    debug_print("Starting long-term cointegration analysis (1 year)...")
     long_stats = find_cointegrated_pairs(symbols_with_sufficient_data, LONG_TERM_HOURS)
     debug_print(f"Long-term analysis complete. Found {len(long_stats)} cointegrated pairs.")
 
-    # Short-term candle counts (only on filtered symbols)
-    symbol_counts_short = {}
-    for t in symbols_with_sufficient_data:
-        series = fetch_bitunix_kline(t, SHORT_TERM_HOURS)
-        symbol_counts_short[t] = len(series) if series is not None else 0
+    debug_print("Starting medium-term cointegration analysis (1 month)...")
+    medium_stats = find_cointegrated_pairs(symbols_with_sufficient_data, MEDIUM_TERM_HOURS)
+    debug_print(f"Medium-term analysis complete. Found {len(medium_stats)} cointegrated pairs.")
 
-    # Short-term analysis
-    debug_print("Starting short-term cointegration analysis...")
+    debug_print("Starting short-term cointegration analysis (1 week)...")
     short_stats = find_cointegrated_pairs(symbols_with_sufficient_data, SHORT_TERM_HOURS)
     debug_print(f"Short-term analysis complete. Found {len(short_stats)} cointegrated pairs.")
 
-    common_pairs = set(long_stats.keys()).intersection(short_stats.keys())
-    debug_print(f"Found {len(common_pairs)} pairs that are cointegrated in both timeframes")
+    # Find pairs cointegrated in all three timeframes
+    common_pairs = set(long_stats.keys()) & set(medium_stats.keys()) & set(short_stats.keys())
+    debug_print(f"Found {len(common_pairs)} pairs cointegrated in all three timeframes")
     
     if not common_pairs:
         debug_print("No overlapping cointegrated pairs found.")
         return
 
+    # Compile results
     results = []
     for i, pair in enumerate(sorted(common_pairs), 1):
         a, b = pair
-        long_data = long_stats[pair]
-        short_data = short_stats[pair]
         results.append({
             'Index': i,
             'Pair': f"{a}/{b}",
-            'Candles_A_Long': symbol_counts_long[a],
-            'Candles_B_Long': symbol_counts_long[b],
-            'Candles_A_Short': symbol_counts_short[a],
-            'Candles_B_Short': symbol_counts_short[b],
-            'P-Value_Long': long_data['p_value'],
-            'Hedge_Ratio_Long': long_data['hedge_ratio'],
-            'N_Candles_Long_Overlap': long_data['n_candles'],
-            'P-Value_Short': short_data['p_value'],
-            'Hedge_Ratio_Short': short_data['hedge_ratio'],
-            'N_Candles_Short_Overlap': short_data['n_candles']
+            'Candles_A_Long': symbol_counts['long'][a],
+            'Candles_B_Long': symbol_counts['long'][b],
+            'Candles_A_Medium': symbol_counts['medium'][a],
+            'Candles_B_Medium': symbol_counts['medium'][b],
+            'Candles_A_Short': symbol_counts['short'][a],
+            'Candles_B_Short': symbol_counts['short'][b],
+            'P-Value_Long': long_stats[pair]['p_value'],
+            'Hedge_Ratio_Long': long_stats[pair]['hedge_ratio'],
+            'N_Candles_Long_Overlap': long_stats[pair]['n_candles'],
+            'P-Value_Medium': medium_stats[pair]['p_value'],
+            'Hedge_Ratio_Medium': medium_stats[pair]['hedge_ratio'],
+            'N_Candles_Medium_Overlap': medium_stats[pair]['n_candles'],
+            'P-Value_Short': short_stats[pair]['p_value'],
+            'Hedge_Ratio_Short': short_stats[pair]['hedge_ratio'],
+            'N_Candles_Short_Overlap': short_stats[pair]['n_candles']
         })
 
     df_res = pd.DataFrame(results)
@@ -338,7 +362,7 @@ def main():
     if csv_path:
         debug_print(f"Results saved to: {csv_path}")
     
-    debug_print("\nCointegrated pairs found:")
+    debug_print("\nCointegrated pairs found across all timeframes:")
     print(df_res.to_string(index=False))
 
     # Visualization option
@@ -355,7 +379,7 @@ def main():
         for i in idxs:
             if 0 <= i < len(results):
                 pair_to_visualize = tuple(results[i]['Pair'].split('/'))
-                visualize_relationship(pair_to_visualize)
+                visualize_three_timeframes(pair_to_visualize)
     else:
         debug_print("No pairs to visualize.")
 
